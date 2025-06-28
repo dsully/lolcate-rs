@@ -268,7 +268,7 @@ impl Database {
                     humantime::format_rfc3339(db.data.metadata()?.modified()?)
                 );
             }
-        };
+        }
 
         println!();
         Ok(())
