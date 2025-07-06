@@ -517,7 +517,10 @@ impl Database {
         ));
 
         FileExt::unlock(&lock)?;
-        fs::remove_file(lockfile)?;
+        
+        if lockfile.exists() {
+            fs::remove_file(lockfile)?;
+        }
 
         Ok(())
     }

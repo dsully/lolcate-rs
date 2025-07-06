@@ -1,60 +1,15 @@
 [package]
-authors = [ "Dan Sully <dan+github@sully.org>" ]
-categories = [ "command-line-utilities", "filesystem" ]
+name = "lolcate-rs"
+version = "0.2.3"
+authors = ["Dan Sully <dan+github@sully.org>"]
+edition = "2024"
 description = "A comically fast way of indexing and querying your filesystem. Replaces locate / mlocate / updatedb."
 documentation = "https://github.com/dsully/lolcate-rs/blob/master/README.md"
-edition = "2024"
-keywords = [ "filesystem-indexer", "search", "regex" ]
-license = "GPL-3.0"
-name = "lolcate-rs"
 readme = "README.md"
 repository = "https://github.com/dsully/lolcate-rs"
-version = "0.2.2"
-
-[dependencies]
-anyhow = "1.0.96"
-bstr = "1.11"
-cachedir = "0"
-clap = { version = "4", features = [ "cargo", "derive" ] }
-colored = "3"
-crossbeam-channel = "0.5"
-figment = { version = "0.10.19", features = [ "toml" ] }
-file_type_enum = "2.0.1"
-fs-err = "3"
-fs4 = { version = "0.12", features = ["sync"] }
-home-dir = "0.1.0"
-humantime = "2.1.0"
-ignore = "0.4"
-indicatif = "0.17.11"
-lz4 = "1"
-num-format = "0.4"
-num_cpus = "1.16.0"
-regex = "1"
-serde = { version = "1.0", features = [ "derive" ] }
-walkdir = "2"
-xdg = "2.5.2"
-
-[[bin]]
-name = "lolcate"
-path = "src/main.rs"
-
-[profile.release]
-debug = true
-incremental = true
-
-# Note that we set these explicitly, and these values were chosen based on
-# a trade-off between compile times and runtime performance
-codegen-units = 16
-lto = "thin"
-
-[profile.dev]
-  [profile.dev.package."*"]
-  opt-level = 3
-
-# The profile that 'cargo dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
+license = "GPL-3.0"
+keywords = ["filesystem-indexer", "regex", "search"]
+categories = ["command-line-utilities", "filesystem"]
 
 # Config for 'cargo dist'
 [workspace.metadata.dist]
@@ -63,16 +18,60 @@ cargo-dist-version = "0.22.1"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = [ "homebrew" ]
+installers = ["homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "dsully/homebrew-tap"
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = [ "aarch64-apple-darwin", "x86_64-unknown-linux-gnu" ]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Publish jobs to run in CI
-publish-jobs = [ "homebrew" ]
+publish-jobs = ["homebrew"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
 
-  # Use Apple Silicon runners.
-  [workspace.metadata.dist.github-custom-runners]
-  aarch64-apple-darwin = "macos-14"
+# Use Apple Silicon runners.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-14"
+
+[[bin]]
+name = "lolcate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.96"
+bstr = "1.11"
+cachedir = "0"
+clap = { version = "4", features = ["cargo", "derive"] }
+colored = "3"
+crossbeam-channel = "0.5"
+figment = { version = "0.10.19", features = ["toml"] }
+file_type_enum = "2.0.1"
+fs4 = { version = "0.13", features = ["sync"] }
+fs-err = "3"
+home-dir = "0.1.0"
+humantime = "2.1.0"
+ignore = "0.4"
+indicatif = "0.18"
+lz4 = "1"
+num_cpus = "1.16.0"
+num-format = "0.4"
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+walkdir = "2"
+xdg = "2"
+
+[profile.release]
+debug = true
+lto = "thin"
+incremental = true
+# Note that we set these explicitly, and these values were chosen based on
+# a trade-off between compile times and runtime performance
+codegen-units = 16
+
+[profile.dev]
+[profile.dev.package."*"]
+opt-level = 3
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
