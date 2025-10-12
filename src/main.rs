@@ -21,12 +21,12 @@ use clap::Parser;
 use colored::Colorize;
 use crossbeam_channel as channel;
 use figment::{
-    providers::{Format, Toml},
     Figment,
+    providers::{Format, Toml},
 };
 use file_type_enum::FileType;
-use fs4::fs_std::FileExt;
 use fs_err as fs;
+use fs4::fs_std::FileExt;
 use home_dir::HomeDirExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use lz4::EncoderBuilder;
@@ -206,12 +206,13 @@ impl Database {
     }
 
     fn xdg_path(path_type: PathType) -> Result<PathBuf> {
-        let xdg_dir =
-            xdg::BaseDirectories::with_prefix("lolcate").context("Failed to get XDG directory")?;
+        let xdg_dir = xdg::BaseDirectories::with_prefix("lolcate");
 
         Ok(match path_type {
-            PathType::Config => xdg_dir.get_config_home(),
-            PathType::Data => xdg_dir.get_data_home(),
+            PathType::Config => xdg_dir
+                .get_config_home()
+                .context("Unable to get config home")?,
+            PathType::Data => xdg_dir.get_data_home().context("Unable to get data home")?,
         })
     }
 
@@ -380,11 +381,11 @@ impl Database {
         //
         if !self.config.exists() {
             print_err!(
-            "Config file not found for database {}.\n Perhaps you forgot to run lolcate --create \
+                "Config file not found for database {}.\n Perhaps you forgot to run lolcate --create \
              {} ?",
-            &self.name.green(),
-            &self.name.green()
-        );
+                &self.name.green(),
+                &self.name.green()
+            );
             process::exit(1);
         }
 
@@ -429,7 +430,7 @@ impl Database {
                 match entry {
                     WorkerResult::Entry(value) => {
                         if FileType::symlink_read_at(&value).is_ok() {
-                            writeln!(encoder, "{}", value.display()).unwrap();
+                            writeln!(encoder, "{}", value.display())?;
                         }
                     }
                     WorkerResult::Error(err) => print_err!("{}", err.to_string()),
@@ -468,14 +469,14 @@ impl Database {
                             })) {
                                 Ok(()) => ignore::WalkState::Continue,
                                 Err(_) => ignore::WalkState::Quit,
-                            }
+                            };
                         }
                     },
                     Err(err) => {
                         return match tx.send(WorkerResult::Error(err)) {
                             Ok(()) => ignore::WalkState::Continue,
                             Err(_) => ignore::WalkState::Quit,
-                        }
+                        };
                     }
                 };
 
@@ -517,7 +518,7 @@ impl Database {
         ));
 
         FileExt::unlock(&lock)?;
-        
+
         if lockfile.exists() {
             fs::remove_file(lockfile)?;
         }

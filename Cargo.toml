@@ -1,7 +1,6 @@
 [package]
 name = "lolcate-rs"
-version = "0.2.3"
-authors = ["Dan Sully <dan+github@sully.org>"]
+version = "0.2.4"
 edition = "2024"
 description = "A comically fast way of indexing and querying your filesystem. Replaces locate / mlocate / updatedb."
 documentation = "https://github.com/dsully/lolcate-rs/blob/master/README.md"
@@ -37,27 +36,31 @@ name = "lolcate"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.96"
-bstr = "1.11"
+anyhow = "1"
+bstr = "1"
 cachedir = "0"
 clap = { version = "4", features = ["cargo", "derive"] }
 colored = "3"
 crossbeam-channel = "0.5"
 figment = { version = "0.10.19", features = ["toml"] }
 file_type_enum = "2.0.1"
-fs4 = { version = "0.13", features = ["sync"] }
 fs-err = "3"
+fs4 = { version = "0.13", features = ["sync"] }
 home-dir = "0.1.0"
-humantime = "2.1.0"
+humantime = "2.3.0"
 ignore = "0.4"
 indicatif = "0.18"
 lz4 = "1"
-num_cpus = "1.16.0"
+num_cpus = "1.17.0"
 num-format = "0.4"
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 walkdir = "2"
-xdg = "2"
+xdg = "3"
+
+[profile.dev]
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 debug = true
@@ -66,10 +69,6 @@ incremental = true
 # Note that we set these explicitly, and these values were chosen based on
 # a trade-off between compile times and runtime performance
 codegen-units = 16
-
-[profile.dev]
-[profile.dev.package."*"]
-opt-level = 3
 
 # The profile that 'cargo dist' will build with
 [profile.dist]
