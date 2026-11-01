@@ -24,9 +24,10 @@ use figment::{
     Figment,
     providers::{Format, Toml},
 };
+use file_locking::FileExt as _;
 use file_type_enum::FileType;
 use fs_err as fs;
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use home_dir::HomeDirExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use lz4::EncoderBuilder;
@@ -406,7 +407,7 @@ impl Database {
 
         println!("Waiting for '{}' database lock ...", self.name.green());
 
-        lock.lock_exclusive()?;
+        let _ = lock.lock_exclusive()?;
 
         println!("File lock for '{}' acquired!", self.name.green());
 
