@@ -1,118 +1,488 @@
 use std::{
-    io::{self, Read, Seek, SeekFrom},
-    ptr,
+    ffi::{c_char, c_int},
+    io::{self, BufReader, Read},
+    ops::{Deref, Range},
+    sync::Arc,
+    thread,
 };
 
-use fs_err as fs;
-use lz4::liblz4::{
-    LZ4F_VERSION, LZ4F_createDecompressionContext, LZ4F_decompress, LZ4F_freeDecompressionContext,
-    LZ4FDecompressOptions, LZ4FDecompressionContext, check_error,
-};
+use crossbeam_channel as channel;
+
+// Built and linked by lz4-sys, which doesn't bind it.
+unsafe extern "C" {
+    fn LZ4_decompress_safe_usingDict(
+        src: *const c_char,
+        dst: *mut c_char,
+        compressed_size: c_int,
+        dst_capacity: c_int,
+        dict_start: *const c_char,
+        dict_size: c_int,
+    ) -> c_int;
+}
 
 const FRAME_MAGIC: u32 = 0x184D_2204;
+const VERSION_MASK: u8 = 0b1100_0000;
+const VERSION_01: u8 = 0b0100_0000;
+const INDEPENDENT_BLOCKS_FLAG: u8 = 0b10_0000;
+const BLOCK_CHECKSUM_FLAG: u8 = 0b1_0000;
+const CONTENT_SIZE_FLAG: u8 = 0b1000;
 const CONTENT_CHECKSUM_FLAG: u8 = 0b100;
-const INPUT_SIZE: usize = 256 * 1024;
+const DICT_ID_FLAG: u8 = 0b1;
+const UNCOMPRESSED_BLOCK: u32 = 0x8000_0000;
+/// Linked blocks may reference this much previously decoded data.
+const HISTORY: usize = 64 * 1024;
+const INPUT_SIZE: usize = 1 << 20;
+const CHECK_QUEUE: usize = 64;
+const WORK_QUEUE: usize = 32;
 
-/// Decodes the first lz4 frame of a file without verifying its content checksum, which instead
-/// is returned by [`FrameReader::stored_checksum`] so the caller can verify it off the decode path.
-pub struct FrameReader {
-    ctx: LZ4FDecompressionContext,
-    file: fs::File,
-    input: Box<[u8]>,
-    pos: usize,
-    len: usize,
-    consumed: u64,
-    has_checksum: bool,
-    done: bool,
+/// A line-aligned piece of the decompressed stream.
+pub struct Chunk {
+    buf: Vec<u8>,
+    range: Range<usize>,
 }
 
-impl FrameReader {
-    pub fn new(mut file: fs::File) -> io::Result<Self> {
-        let mut ctx = LZ4FDecompressionContext(ptr::null_mut());
-        // SAFETY: `ctx` is a valid out-pointer; ownership is released in `Drop`.
-        check_error(unsafe { LZ4F_createDecompressionContext(&mut ctx, LZ4F_VERSION) })?;
+impl Deref for Chunk {
+    type Target = [u8];
 
-        let mut input = vec![0u8; INPUT_SIZE].into_boxed_slice();
-        let len = crate::read_full(&mut file, &mut input)?;
-        let has_checksum = len > 4
-            && u32::from_le_bytes([input[0], input[1], input[2], input[3]]) == FRAME_MAGIC
-            && input[4] & CONTENT_CHECKSUM_FLAG != 0;
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.range.clone()]
+    }
+}
 
-        Ok(Self {
-            ctx,
-            file,
-            input,
-            pos: 0,
-            len,
-            consumed: 0,
-            has_checksum,
-            done: false,
-        })
+struct Frame {
+    block_max: usize,
+    independent: bool,
+    block_checksum: bool,
+    content_checksum: bool,
+}
+
+fn lz4_error(name: &str) -> io::Error {
+    io::Error::other(format!("LZ4 error: {name}"))
+}
+
+/// Like `read_exact`, but reports EOF as `false`.
+fn read_or_eof(input: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
+    match input.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads until `buf` is full or the input ends, returning the number of bytes read.
+fn read_up_to(input: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match input.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+fn read_u32(input: &mut impl Read) -> io::Result<Option<u32>> {
+    let mut bytes = [0u8; 4];
+    Ok(read_or_eof(input, &mut bytes)?.then(|| u32::from_le_bytes(bytes)))
+}
+
+fn read_header(input: &mut impl Read) -> io::Result<Option<Frame>> {
+    let mut fixed = [0u8; 6];
+    if !read_or_eof(input, &mut fixed)? {
+        return Ok(None);
+    }
+    if u32::from_le_bytes([fixed[0], fixed[1], fixed[2], fixed[3]]) != FRAME_MAGIC {
+        return Err(lz4_error("ERROR_frameType_unknown"));
+    }
+    let (flags, block_descriptor) = (fixed[4], fixed[5]);
+    if flags & VERSION_MASK != VERSION_01 {
+        return Err(lz4_error("ERROR_headerVersion_wrong"));
+    }
+    if flags & DICT_ID_FLAG != 0 {
+        return Err(lz4_error("ERROR_dictionary_unsupported"));
     }
 
-    /// The frame's stored content checksum, once the frame has been fully read.
-    pub fn stored_checksum(&mut self) -> io::Result<Option<u32>> {
-        if !self.done || !self.has_checksum {
+    let mut descriptor = vec![flags, block_descriptor];
+    if flags & CONTENT_SIZE_FLAG != 0 {
+        let mut size = [0u8; 8];
+        if !read_or_eof(input, &mut size)? {
             return Ok(None);
         }
-        let mut stored = [0u8; 4];
-        self.file.seek(SeekFrom::Start(self.consumed - 4))?;
-        self.file.read_exact(&mut stored)?;
-        Ok(Some(u32::from_le_bytes(stored)))
+        descriptor.extend_from_slice(&size);
+    }
+    let mut header_checksum = [0u8; 1];
+    if !read_or_eof(input, &mut header_checksum)? {
+        return Ok(None);
+    }
+    let mut hash = Xxh32::default();
+    hash.update(&descriptor);
+    if (hash.digest() >> 8).to_le_bytes()[0] != header_checksum[0] {
+        return Err(lz4_error("ERROR_headerChecksum_invalid"));
+    }
+
+    let block_max = match (block_descriptor >> 4) & 0b111 {
+        4 => 64 * 1024,
+        5 => 256 * 1024,
+        6 => 1024 * 1024,
+        7 => 4 * 1024 * 1024,
+        _ => return Err(lz4_error("ERROR_maxBlockSize_invalid")),
+    };
+
+    Ok(Some(Frame {
+        block_max,
+        independent: flags & INDEPENDENT_BLOCKS_FLAG != 0,
+        block_checksum: flags & BLOCK_CHECKSUM_FLAG != 0,
+        content_checksum: flags & CONTENT_CHECKSUM_FLAG != 0,
+    }))
+}
+
+/// Raw block: compressed `data` unless `stored`, with its stored block checksum if the frame has them.
+struct Block {
+    data: Vec<u8>,
+    stored: bool,
+    checksum: Option<u32>,
+}
+
+enum Next {
+    Block(Block),
+    /// The frame is truncated after this block.
+    Last(Block),
+    End,
+    Truncated,
+}
+
+impl Block {
+    fn read(input: &mut impl Read, frame: &Frame) -> io::Result<Next> {
+        let Some(size) = read_u32(input)? else {
+            return Ok(Next::Truncated);
+        };
+        if size == 0 {
+            return Ok(Next::End);
+        }
+        let len = (size & !UNCOMPRESSED_BLOCK) as usize;
+        if len > frame.block_max {
+            return Err(lz4_error("ERROR_maxBlockSize_invalid"));
+        }
+        let stored = size & UNCOMPRESSED_BLOCK != 0;
+        let mut data = vec![0u8; len];
+        let read = read_up_to(input, &mut data)?;
+        if read < len {
+            // `lz4::Decoder` passes on what there is of a truncated uncompressed block.
+            data.truncate(if stored { read } else { 0 });
+            return Ok(Next::Last(Self {
+                data,
+                stored: true,
+                checksum: None,
+            }));
+        }
+        let checksum = if frame.block_checksum {
+            let Some(checksum) = read_u32(input)? else {
+                return Ok(Next::Truncated);
+            };
+            Some(checksum)
+        } else {
+            None
+        };
+        Ok(Next::Block(Self {
+            data,
+            stored,
+            checksum,
+        }))
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        match self.checksum {
+            Some(stored) if xxh32(&self.data) != stored => {
+                Err(lz4_error("ERROR_blockChecksum_invalid"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Decodes into the first `block_max` bytes of `dst`, returning the decoded length.
+    fn decode_into(&self, dst: &mut [u8], dict: &[u8], block_max: usize) -> io::Result<usize> {
+        let dst = &mut dst[..block_max];
+        if self.stored {
+            dst[..self.data.len()].copy_from_slice(&self.data);
+            return Ok(self.data.len());
+        }
+        let to_c_int = |n: usize| c_int::try_from(n).expect("block sizes fit in c_int");
+        // SAFETY: every pointer/length pair describes a live slice.
+        let written = unsafe {
+            LZ4_decompress_safe_usingDict(
+                self.data.as_ptr().cast(),
+                dst.as_mut_ptr().cast(),
+                to_c_int(self.data.len()),
+                to_c_int(dst.len()),
+                dict.as_ptr().cast(),
+                to_c_int(dict.len()),
+            )
+        };
+        usize::try_from(written).map_err(|_| lz4_error("ERROR_decompressionFailed"))
     }
 }
 
-impl Read for FrameReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // lz4 >= 1.9.4 reads the first reserved field as `skipChecksums`.
-        let options = LZ4FDecompressOptions {
-            stable_dst: 0,
-            reserved: [1, 0, 0],
+/// Decodes the first lz4 frame of `input` into line-aligned chunks sent to `tx`, in no particular
+/// order.
+///
+/// Block checksums, when present, are verified instead of the content checksum, so independent
+/// blocks can be decoded and verified in parallel. A truncated frame ends the stream early, as
+/// `lz4::Decoder` does.
+pub fn decode(
+    input: impl Read,
+    chunk_size: usize,
+    tx: &channel::Sender<Arc<Chunk>>,
+) -> io::Result<()> {
+    let mut input = BufReader::with_capacity(INPUT_SIZE, input);
+    let Some(frame) = read_header(&mut input)? else {
+        return Ok(());
+    };
+    if frame.independent && (frame.block_checksum || !frame.content_checksum) {
+        decode_parallel(&mut input, &frame, tx)
+    } else {
+        decode_sequential(&mut input, &frame, chunk_size, tx)
+    }
+}
+
+enum Check {
+    Block(Block),
+    Content(Arc<Chunk>),
+}
+
+fn run_checks(checks: channel::Receiver<Check>) -> io::Result<u32> {
+    let mut content = Xxh32::default();
+    for check in checks {
+        match check {
+            Check::Block(block) => block.verify()?,
+            Check::Content(chunk) => content.update(&chunk),
+        }
+    }
+    Ok(content.digest())
+}
+
+/// Decodes in stream order (required for linked blocks and for the content checksum), with
+/// checksums verified on another thread.
+fn decode_sequential(
+    input: &mut impl Read,
+    frame: &Frame,
+    chunk_size: usize,
+    tx: &channel::Sender<Arc<Chunk>>,
+) -> io::Result<()> {
+    let hash_content = frame.content_checksum && !frame.block_checksum;
+    let (check_tx, check_rx) = channel::bounded(CHECK_QUEUE);
+    thread::scope(|s| {
+        let checker = s.spawn(move || run_checks(check_rx));
+        let stored = decode_in_order(input, frame, chunk_size, tx, &check_tx, hash_content);
+        drop(check_tx);
+        let digest = checker.join().expect("Unable to join threads")?;
+        if stored?.is_some_and(|stored| hash_content && stored != digest) {
+            return Err(lz4_error("ERROR_contentChecksum_invalid"));
+        }
+        Ok(())
+    })
+}
+
+/// Returns the stored content checksum, if the frame was read to its end and has one.
+fn decode_in_order(
+    input: &mut impl Read,
+    frame: &Frame,
+    chunk_size: usize,
+    tx: &channel::Sender<Arc<Chunk>>,
+    checks: &channel::Sender<Check>,
+    hash_content: bool,
+) -> io::Result<Option<u32>> {
+    let send = |chunk: Chunk| {
+        let chunk = Arc::new(chunk);
+        (!hash_content || checks.send(Check::Content(chunk.clone())).is_ok())
+            && tx.send(chunk).is_ok()
+    };
+
+    // Blocks decode straight into `buf` after the history they may reference, which is carried
+    // over into each new buffer.
+    let mut buf = vec![0u8; chunk_size.max(2 * frame.block_max)];
+    let mut start = 0;
+    let mut pos = 0;
+
+    let complete = loop {
+        let (block, last) = match Block::read(input, frame)? {
+            Next::Block(block) => (block, false),
+            Next::Last(block) => (block, true),
+            Next::End => break true,
+            Next::Truncated => break false,
         };
 
-        while !self.done && !buf.is_empty() {
-            if self.pos == self.len {
-                self.len = self.file.read(&mut self.input)?;
-                self.pos = 0;
-                if self.len == 0 {
-                    // Truncated frame: end the stream, matching `lz4::Decoder`.
-                    return Ok(0);
-                }
-            }
-
-            let mut src_size = self.len - self.pos;
-            let mut dst_size = buf.len();
-            // SAFETY: both sizes describe the live lengths of the slices whose pointers are passed.
-            let hint = check_error(unsafe {
-                LZ4F_decompress(
-                    self.ctx,
-                    buf.as_mut_ptr(),
-                    &mut dst_size,
-                    self.input[self.pos..].as_ptr(),
-                    &mut src_size,
-                    &raw const options,
-                )
-            })?;
-
-            self.pos += src_size;
-            self.consumed += src_size as u64;
-            self.done = hint == 0;
-
-            if dst_size > 0 {
-                return Ok(dst_size);
+        while buf.len() - pos < frame.block_max {
+            let Some(i) = memchr::memrchr(b'\n', &buf[start..pos]) else {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            };
+            let end = start + i + 1;
+            let keep_from = end.min(pos.saturating_sub(HISTORY));
+            let mut next = vec![0u8; buf.len()];
+            next[..pos - keep_from].copy_from_slice(&buf[keep_from..pos]);
+            let chunk = Chunk {
+                buf: std::mem::replace(&mut buf, next),
+                range: start..end,
+            };
+            start = end - keep_from;
+            pos -= keep_from;
+            if !send(chunk) {
+                return Ok(None);
             }
         }
-        Ok(0)
+
+        let dict_len = if frame.independent {
+            0
+        } else {
+            HISTORY.min(pos)
+        };
+        let (history, dst) = buf.split_at_mut(pos);
+        pos += block.decode_into(dst, &history[pos - dict_len..], frame.block_max)?;
+        if block.checksum.is_some() && checks.send(Check::Block(block)).is_err() {
+            return Ok(None);
+        }
+        if last {
+            break false;
+        }
+    };
+
+    if pos > start
+        && !send(Chunk {
+            buf,
+            range: start..pos,
+        })
+    {
+        return Ok(None);
+    }
+
+    if complete && frame.content_checksum {
+        read_u32(input)
+    } else {
+        Ok(None)
     }
 }
 
-impl Drop for FrameReader {
-    fn drop(&mut self) {
-        // SAFETY: `ctx` was created in `new` and is not used after this.
-        unsafe {
-            LZ4F_freeDecompressionContext(self.ctx);
+/// The partial lines at the edges of a decoded independent block.
+struct Edges {
+    index: usize,
+    /// Up to and including the block's first `\n`, or the whole block if it has none.
+    head: Vec<u8>,
+    /// After the block's last `\n`; `None` if it has none.
+    tail: Option<Vec<u8>>,
+}
+
+fn decode_parallel(
+    input: &mut impl Read,
+    frame: &Frame,
+    tx: &channel::Sender<Arc<Chunk>>,
+) -> io::Result<()> {
+    let (work_tx, work_rx) = channel::bounded::<(usize, Block)>(WORK_QUEUE);
+
+    let edges = thread::scope(|s| {
+        let workers: Vec<_> = (0..num_cpus::get())
+            .map(|_| {
+                let work_rx = work_rx.clone();
+                s.spawn(move || {
+                    work_rx
+                        .into_iter()
+                        .map(|(index, block)| decode_independent(index, &block, frame, tx))
+                        .collect::<io::Result<Vec<_>>>()
+                })
+            })
+            .collect();
+        drop(work_rx);
+
+        let mut index = 0;
+        let read = loop {
+            match Block::read(input, frame) {
+                Ok(Next::Block(block)) => {
+                    if work_tx.send((index, block)).is_err() {
+                        break Ok(());
+                    }
+                    index += 1;
+                }
+                Ok(Next::Last(block)) => {
+                    let _ = work_tx.send((index, block));
+                    index += 1;
+                    break Ok(());
+                }
+                Ok(Next::End | Next::Truncated) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        drop(work_tx);
+
+        let mut edges = Vec::with_capacity(index);
+        for worker in workers {
+            edges.extend(worker.join().expect("Unable to join threads")?);
+        }
+        read.map(|()| edges)
+    })?;
+
+    let stitched = stitch(edges);
+    if !stitched.is_empty() {
+        let _ = tx.send(Arc::new(Chunk {
+            range: 0..stitched.len(),
+            buf: stitched,
+        }));
+    }
+    Ok(())
+}
+
+/// Sends the block's complete lines to `tx` and returns the partial lines at its edges.
+fn decode_independent(
+    index: usize,
+    block: &Block,
+    frame: &Frame,
+    tx: &channel::Sender<Arc<Chunk>>,
+) -> io::Result<Edges> {
+    block.verify()?;
+    let mut buf = vec![0u8; frame.block_max];
+    let len = block.decode_into(&mut buf, &[], frame.block_max)?;
+    buf.truncate(len);
+
+    let (Some(first), Some(last)) = (memchr::memchr(b'\n', &buf), memchr::memrchr(b'\n', &buf))
+    else {
+        return Ok(Edges {
+            index,
+            head: buf,
+            tail: None,
+        });
+    };
+    let head = buf[..=first].to_vec();
+    let tail = buf[last + 1..].to_vec();
+    if first < last {
+        let _ = tx.send(Arc::new(Chunk {
+            buf,
+            range: first + 1..last + 1,
+        }));
+    }
+    Ok(Edges {
+        index,
+        head,
+        tail: Some(tail),
+    })
+}
+
+/// Joins the blocks' edges, in stream order, into the lines that span block boundaries.
+fn stitch(mut edges: Vec<Edges>) -> Vec<u8> {
+    edges.sort_unstable_by_key(|e| e.index);
+    let mut lines = Vec::new();
+    let mut carry = Vec::new();
+    for edge in edges {
+        match edge.tail {
+            None => carry.extend_from_slice(&edge.head),
+            Some(tail) => {
+                lines.append(&mut carry);
+                lines.extend_from_slice(&edge.head);
+                carry = tail;
+            }
         }
     }
+    lines.append(&mut carry);
+    lines
 }
 
 const P1: u32 = 0x9E37_79B1;
@@ -121,7 +491,13 @@ const P3: u32 = 0xC2B2_AE3D;
 const P4: u32 = 0x27D4_EB2F;
 const P5: u32 = 0x1656_67B1;
 
-/// Streaming XXH32 with seed 0, as used for lz4 frame content checksums.
+fn xxh32(data: &[u8]) -> u32 {
+    let mut hash = Xxh32::default();
+    hash.update(data);
+    hash.digest()
+}
+
+/// Streaming XXH32 with seed 0, as used for lz4 frame checksums.
 pub struct Xxh32 {
     acc: [u32; 4],
     buf: [u8; 16],
@@ -221,12 +597,174 @@ impl Xxh32 {
 
 #[cfg(test)]
 mod tests {
-    use super::Xxh32;
+    use std::io::Write;
 
-    fn xxh32(data: &[u8]) -> u32 {
-        let mut h = Xxh32::default();
-        h.update(data);
-        h.digest()
+    use crossbeam_channel as channel;
+    use lz4::{BlockMode, BlockSize, ContentChecksum, EncoderBuilder, liblz4::BlockChecksum};
+
+    use std::collections::HashSet;
+
+    use super::{Xxh32, decode, xxh32};
+
+    /// Path-like lines, a stretch of incompressible lines (stored as uncompressed blocks), and a
+    /// line longer than any chunk or block.
+    fn sample() -> Vec<u8> {
+        let mut seed = 0x2545_F491_u32;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut data = Vec::new();
+        for i in 0..40_000 {
+            writeln!(
+                data,
+                "/Users/someone/dev/project{}/src/module{}/file{i}.rs",
+                i % 37,
+                i % 11
+            )
+            .expect("write to Vec");
+        }
+        for _ in 0..4_000 {
+            data.extend((0..100).map(|_| b' ' + (rand() % 95) as u8));
+            data.push(b'\n');
+        }
+        data.extend(std::iter::repeat_n(b'x', 9 << 20));
+        data.push(b'\n');
+        for i in 0..10_000 {
+            writeln!(data, "/opt/tail/{i}").expect("write to Vec");
+        }
+        data
+    }
+
+    fn encode(data: &[u8], configure: impl Fn(&mut EncoderBuilder)) -> Vec<u8> {
+        let mut builder = EncoderBuilder::new();
+        configure(&mut builder);
+        let mut encoder = builder.build(Vec::new()).expect("encoder");
+        for piece in data.chunks(10_000) {
+            encoder.write_all(piece).expect("encode");
+        }
+        let (out, result) = encoder.finish();
+        result.expect("finish");
+        out
+    }
+
+    fn configure(
+        size: &BlockSize,
+        mode: &BlockMode,
+        block_checksum: bool,
+        content_checksum: bool,
+    ) -> impl Fn(&mut EncoderBuilder) {
+        move |b| {
+            b.block_size(size.clone())
+                .block_mode(mode.clone())
+                .block_checksum(if block_checksum {
+                    BlockChecksum::BlockChecksumEnabled
+                } else {
+                    BlockChecksum::NoBlockChecksum
+                })
+                .checksum(if content_checksum {
+                    ContentChecksum::ChecksumEnabled
+                } else {
+                    ContentChecksum::NoChecksum
+                });
+        }
+    }
+
+    fn decode_all(compressed: &[u8]) -> (Vec<Vec<u8>>, std::io::Result<()>) {
+        let (tx, rx) = channel::unbounded();
+        let result = decode(compressed, 1 << 20, &tx);
+        drop(tx);
+        (rx.into_iter().map(|chunk| chunk.to_vec()).collect(), result)
+    }
+
+    fn lines(data: &[u8]) -> Vec<&[u8]> {
+        data.split_inclusive(|&b| b == b'\n').collect()
+    }
+
+    const LAYOUTS: [(BlockSize, BlockMode, bool, bool); 7] = [
+        (BlockSize::Max256KB, BlockMode::Linked, true, true),
+        (BlockSize::Max64KB, BlockMode::Linked, false, true),
+        (BlockSize::Max1MB, BlockMode::Linked, false, false),
+        (BlockSize::Max64KB, BlockMode::Independent, true, false),
+        (BlockSize::Max4MB, BlockMode::Independent, true, true),
+        (BlockSize::Max256KB, BlockMode::Independent, false, true),
+        (BlockSize::Max1MB, BlockMode::Independent, false, false),
+    ];
+
+    #[test]
+    fn decodes_every_frame_layout() {
+        let data = sample();
+        let mut expected = lines(&data);
+        expected.sort_unstable();
+        for (size, mode, block_checksum, content_checksum) in LAYOUTS {
+            let layout = format!("{size:?} {mode:?} {block_checksum} {content_checksum}");
+            let compressed = encode(
+                &data,
+                configure(&size, &mode, block_checksum, content_checksum),
+            );
+            let (chunks, result) = decode_all(&compressed);
+            result.expect("decode");
+
+            assert!(chunks.iter().all(|c| c.ends_with(b"\n")), "{layout}");
+            let mut decoded: Vec<_> = chunks.iter().flat_map(|c| lines(c)).collect();
+            decoded.sort_unstable();
+            assert!(decoded == expected, "{layout}");
+        }
+    }
+
+    #[test]
+    fn truncated_frame_yields_complete_lines_of_a_prefix() {
+        let data = sample();
+        let known: HashSet<_> = lines(&data).into_iter().collect();
+        for (size, mode, block_checksum, content_checksum) in LAYOUTS {
+            let compressed = encode(
+                &data,
+                configure(&size, &mode, block_checksum, content_checksum),
+            );
+            for cut in [0, 3, 7, 100, compressed.len() / 3, compressed.len() - 1] {
+                let case = format!("{size:?} {mode:?} {block_checksum} cut at {cut}");
+                let (chunks, result) = decode_all(&compressed[..cut]);
+                result.expect(&case);
+                let decoded: Vec<_> = chunks.iter().flat_map(|c| lines(c)).collect();
+                assert!(
+                    decoded.iter().map(|l| l.len()).sum::<usize>() <= data.len(),
+                    "{case}"
+                );
+                let partial = decoded.iter().filter(|l| !known.contains(*l)).count();
+                assert!(partial <= 1, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_corrupt_input() {
+        assert!(decode_all(b"not an lz4 frame").1.is_err());
+
+        let data = sample();
+        for (size, mode, block_checksum, content_checksum) in LAYOUTS {
+            let case = format!("{size:?} {mode:?} {block_checksum} {content_checksum}");
+            let compressed = encode(
+                &data,
+                configure(&size, &mode, block_checksum, content_checksum),
+            );
+
+            let mut header = compressed.clone();
+            header[6] ^= 0xff;
+            assert!(decode_all(&header).1.is_err(), "header: {case}");
+
+            if block_checksum {
+                let mut block = compressed.clone();
+                block[40] ^= 0x01;
+                assert!(decode_all(&block).1.is_err(), "block: {case}");
+            } else if content_checksum {
+                let mut content = compressed.clone();
+                let last = content.len() - 1;
+                content[last] ^= 0x01;
+                assert!(decode_all(&content).1.is_err(), "content: {case}");
+            }
+        }
     }
 
     #[test]

@@ -30,7 +30,7 @@ use figment::{
     providers::{Format, Toml},
 };
 use file_locking::FileExt as _;
-use frame::{FrameReader, Xxh32};
+use frame::Chunk;
 use fs_err as fs;
 use fs4::FileExt;
 use home_dir::HomeDirExt;
@@ -222,35 +222,19 @@ impl Database {
         })
     }
 
-    /// Streams the decompressed database to `consume` as line-aligned chunks, while its content
-    /// checksum is verified on another thread.
+    /// Streams the decompressed, verified database to `consume` as line-aligned chunks, in no
+    /// particular order.
     fn scan<T: Send>(
         &self,
-        consume: impl FnOnce(channel::Receiver<Arc<Vec<u8>>>) -> T + Send,
+        consume: impl FnOnce(channel::Receiver<Arc<Chunk>>) -> T + Send,
     ) -> Result<T> {
-        let mut reader = FrameReader::new(fs::File::open(&self.data)?)?;
-        let (tx, rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
-        let (hash_tx, hash_rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
+        let file = fs::File::open(&self.data)?;
+        let (tx, rx) = channel::bounded::<Arc<Chunk>>(CHUNK_QUEUE);
 
         thread::scope(|s| {
-            let decoder = s.spawn(move || {
-                read_chunks(&mut reader, &[tx, hash_tx])?;
-                reader.stored_checksum()
-            });
-            let hasher = s.spawn(move || {
-                let mut hash = Xxh32::default();
-                for chunk in hash_rx {
-                    hash.update(&chunk);
-                }
-                hash.digest()
-            });
-
+            let decoder = s.spawn(move || frame::decode(file, CHUNK_SIZE, &tx));
             let result = consume(rx);
-            let stored = decoder.join().expect("Unable to join threads")?;
-            let actual = hasher.join().expect("Unable to join threads");
-            if stored.is_some_and(|stored| stored != actual) {
-                return Err(io::Error::other("LZ4 error: ERROR_contentChecksum_invalid").into());
-            }
+            decoder.join().expect("Unable to join threads")?;
             Ok(result)
         })
     }
@@ -471,8 +455,10 @@ impl Database {
         let stdout_thread = thread::spawn(move || {
             let mut encoder = EncoderBuilder::new()
                 .level(3)
-                .block_mode(lz4::BlockMode::Linked)
-                .block_size(lz4::BlockSize::Max256KB)
+                // Independent, checksummed blocks are decoded and verified in parallel by queries.
+                .block_mode(lz4::BlockMode::Independent)
+                .block_size(lz4::BlockSize::Max4MB)
+                .block_checksum(lz4::liblz4::BlockChecksum::BlockChecksumEnabled)
                 .build(database)?;
 
             for entry in rx {
@@ -603,42 +589,6 @@ fn exclude_newline(hir: Hir) -> Option<Hir> {
     })
 }
 
-/// Sends `reader`'s contents in chunks of roughly `CHUNK_SIZE` that each end at a line boundary.
-fn read_chunks(
-    reader: &mut impl io::Read,
-    txs: &[channel::Sender<Arc<Vec<u8>>>],
-) -> io::Result<()> {
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    let mut len = 0;
-
-    loop {
-        if len == buf.len() {
-            buf.resize(buf.len() * 2, 0);
-        }
-        let n = read_full(reader, &mut buf[len..])?;
-        let eof = len + n < buf.len();
-        len += n;
-
-        let end = if eof {
-            len
-        } else if let Some(i) = memchr::memrchr(b'\n', &buf[..len]) {
-            i + 1
-        } else {
-            continue;
-        };
-
-        let mut next = vec![0u8; buf.len()];
-        next[..len - end].copy_from_slice(&buf[end..len]);
-        buf.truncate(end);
-        let chunk = Arc::new(std::mem::replace(&mut buf, next));
-        len -= end;
-
-        if txs.iter().any(|tx| tx.send(chunk.clone()).is_err()) || eof {
-            return Ok(());
-        }
-    }
-}
-
 /// Decides which walked paths are indexed and sends them to the database writer.
 struct Indexer {
     tx: channel::Sender<WorkerResult>,
@@ -749,18 +699,6 @@ fn probe_dir(dir: &Path) -> DirProbe {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => DirProbe::Unsearchable,
         Err(_) => DirProbe::Untagged,
     }
-}
-fn read_full(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(filled)
 }
 
 pub struct Matcher {
