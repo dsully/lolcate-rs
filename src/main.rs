@@ -474,18 +474,17 @@ impl Database {
             any_unsearchable: AtomicBool::new(false),
         });
 
-        // Excluded and bundle directories are decided here rather than in the visitor, because the
-        // walker reads a directory (and its ignore files) before visiting it.
+        // Bundle directories are decided here, so the walker never reads them. Other directories are
+        // decided when visited, right after the walker has read them: probing a directory whose
+        // metadata was just read is far cheaper than probing it from its parent.
         let filter = {
             let indexer = indexer.clone();
             move |e: &ignore::DirEntry| {
-                if !e.file_type().is_none_or(|t| t.is_dir() || t.is_symlink()) {
+                if !(e.file_type().is_some_and(|t| t.is_dir()) && is_bundle_dir(e.path())) {
                     return true;
                 }
-                matches!(
-                    indexer.visit(e.path(), e.file_type(), false),
-                    ignore::WalkState::Continue
-                )
+                let _ = indexer.visit(e.path(), e.file_type(), false);
+                false
             }
         };
 
@@ -520,12 +519,7 @@ impl Database {
                     DirEntry::Normal(e) => e.depth() == 0,
                     DirEntry::BrokenSymlink(_) => true,
                 };
-                let file_type = entry.file_type();
-                if !root && file_type.is_none_or(|t| t.is_dir() || t.is_symlink()) {
-                    // Already indexed by the filter.
-                    return ignore::WalkState::Continue;
-                }
-                indexer.visit(entry.path(), file_type, root)
+                indexer.visit(entry.path(), entry.file_type(), root)
             })
         });
 
@@ -709,34 +703,31 @@ fn is_bundle_dir(path: &Path) -> bool {
             .any(|suffix| path.ends_with(suffix))
     })
 }
+
 enum DirProbe {
     Tagged,
     Untagged,
     Unsearchable,
 }
 
-/// One `open` both checks `dir` for a valid `CACHEDIR.TAG` and, since that needs search
-/// permission on `dir`, whether its entries can be stat'ed.
+/// One `lstat` both checks `dir` for a `CACHEDIR.TAG` and, since that needs search permission on
+/// `dir`, whether its entries can be stat'ed. The tag is opened only if it exists: `open` costs far
+/// more than `lstat` here, even for a missing file.
 fn probe_dir(dir: &Path) -> DirProbe {
-    match std::fs::File::open(dir.join("CACHEDIR.TAG")) {
-        Ok(mut tag) => {
+    let tag = dir.join("CACHEDIR.TAG");
+    match tag.symlink_metadata() {
+        Ok(_) => {
             let mut header = [0u8; cachedir::HEADER.len()];
-            if tag
-                .read(&mut header)
-                .is_ok_and(|n| n == header.len() && header == *cachedir::HEADER)
-            {
+            if std::fs::File::open(&tag).is_ok_and(|mut tag| {
+                tag.read(&mut header)
+                    .is_ok_and(|n| n == header.len() && header == *cachedir::HEADER)
+            }) {
                 DirProbe::Tagged
             } else {
                 DirProbe::Untagged
             }
         }
-        // EACCES may also come from an unreadable tag file in a searchable directory.
-        Err(e)
-            if e.kind() == io::ErrorKind::PermissionDenied
-                && dir.join(".").symlink_metadata().is_err() =>
-        {
-            DirProbe::Unsearchable
-        }
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => DirProbe::Unsearchable,
         Err(_) => DirProbe::Untagged,
     }
 }
