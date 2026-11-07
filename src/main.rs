@@ -6,7 +6,8 @@
 )]
 
 use std::{
-    collections::BTreeSet,
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap},
     io::{self, Write},
     path::{Path, PathBuf},
     process, str,
@@ -15,6 +16,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+mod frame;
 use anyhow::{Context, Result};
 use bstr::io::BufReadExt;
 use clap::Parser;
@@ -26,16 +28,24 @@ use figment::{
 };
 use file_locking::FileExt as _;
 use file_type_enum::FileType;
+use frame::{FrameReader, Xxh32};
 use fs_err as fs;
 use fs4::FileExt;
 use home_dir::HomeDirExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use lz4::EncoderBuilder;
 use num_format::{Locale, ToFormattedString};
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, bytes};
+use regex_syntax::hir::{
+    Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Literal,
+    Look,
+};
 use serde::Deserialize;
 
 static UPPER_RE: OnceLock<Regex> = OnceLock::new();
+
+const CHUNK_SIZE: usize = 1 << 21;
+const CHUNK_QUEUE: usize = 16;
 
 static PROJECT_CONFIG_TEMPLATE: &str = r#"
 description = ""
@@ -151,7 +161,6 @@ pub struct Database {
     pub config: PathBuf,
     pub ignores: PathBuf,
     pub data: PathBuf,
-    pub files: usize,
 }
 
 impl Database {
@@ -164,16 +173,6 @@ impl Database {
 
         let description = Self::config(name).unwrap_or_default().description;
 
-        let lines = if database_path.exists() {
-            let input_file = fs::File::open(&database_path)?;
-            let decoder = lz4::Decoder::new(input_file)?;
-            let reader = io::BufReader::new(decoder);
-
-            reader.byte_lines().count()
-        } else {
-            0
-        };
-
         Ok(Self {
             name: name.to_string(),
             description,
@@ -181,7 +180,6 @@ impl Database {
             config: config_path,
             ignores: config.join(name).join("ignores"),
             data: database_path,
-            files: lines,
         })
     }
 
@@ -204,6 +202,14 @@ impl Database {
                 )
             })
             .collect()
+    }
+
+    pub fn files(&self) -> Result<usize> {
+        if !self.data.exists() {
+            return Ok(0);
+        }
+        let reader = io::BufReader::new(lz4::Decoder::new(fs::File::open(&self.data)?)?);
+        Ok(reader.byte_lines().count())
     }
 
     fn xdg_path(path_type: PathType) -> Result<PathBuf> {
@@ -263,7 +269,7 @@ impl Database {
                 println!("  Database File: {}", db.data.display());
                 println!(
                     "  Paths Indexed: {}",
-                    db.files.to_formatted_string(&Locale::en)
+                    db.files()?.to_formatted_string(&Locale::en)
                 );
                 println!(
                     "   Last Updated: {}",
@@ -296,7 +302,7 @@ impl Database {
         Ok(paths)
     }
 
-    pub fn query(&self, patterns_re: &[Regex]) -> Result<()> {
+    pub fn query(&self, patterns: &[Matcher]) -> Result<()> {
         if !self.data.parent().expect("Unable to get parent").exists() {
             print_err!(
                 "Database {} doesn't exist. Perhaps you forgot to run lolcate --create {} ?",
@@ -315,43 +321,67 @@ impl Database {
             process::exit(1);
         }
 
-        let mut reader = io::BufReader::new(lz4::Decoder::new(fs::File::open(&self.data)?)?);
+        let mut reader = FrameReader::new(fs::File::open(&self.data)?)?;
         let mut writer = io::BufWriter::new(io::stdout().lock());
 
-        let mut matches: Vec<String> = vec![];
+        let (tx, rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
+        let (hash_tx, hash_rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
 
-        reader.for_byte_line(|line_| {
-            let line = str::from_utf8(line_).expect("Invalid UTF-8");
-
-            for re in patterns_re {
-                if !re.is_match(line) {
-                    continue;
+        let runs = thread::scope(|s| -> Result<Vec<Vec<String>>> {
+            let decoder = s.spawn(move || {
+                read_chunks(&mut reader, &[tx, hash_tx])?;
+                reader.stored_checksum()
+            });
+            let hasher = s.spawn(move || {
+                let mut hash = Xxh32::default();
+                for chunk in hash_rx {
+                    hash.update(&chunk);
                 }
+                hash.digest()
+            });
 
-                let mut highlighted = String::new();
-                let mut last_end = 0;
+            let workers: Vec<_> = (0..num_cpus::get())
+                .map(|_| {
+                    let rx = rx.clone();
+                    s.spawn(move || {
+                        let mut out = vec![];
+                        for chunk in rx {
+                            for matcher in patterns {
+                                matcher.search(&chunk, &mut out);
+                            }
+                        }
+                        out.sort_unstable();
+                        out
+                    })
+                })
+                .collect();
+            drop(rx);
 
-                for mat in re.find_iter(line) {
-                    highlighted.push_str(&line[last_end..mat.start()]);
-                    highlighted.push_str("\x1b[31m");
-                    highlighted.push_str(mat.as_str());
-                    highlighted.push_str("\x1b[0m");
-                    last_end = mat.end();
-                }
-
-                highlighted.push_str(&line[last_end..]);
-
-                matches.push(highlighted);
+            let runs: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("Unable to join threads"))
+                .collect();
+            let stored = decoder.join().expect("Unable to join threads")?;
+            let actual = hasher.join().expect("Unable to join threads");
+            if stored.is_some_and(|stored| stored != actual) {
+                return Err(io::Error::other("LZ4 error: ERROR_contentChecksum_invalid").into());
             }
-
-            Ok(true)
+            Ok(runs)
         })?;
 
-        matches.sort();
+        let mut runs: Vec<_> = runs.into_iter().map(Vec::into_iter).collect();
+        let mut heap: BinaryHeap<_> = runs
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, run)| Some(Reverse((run.next()?, i))))
+            .collect();
 
-        for m in matches {
+        while let Some(Reverse((m, i))) = heap.pop() {
             let _ = writer.write_all(m.as_bytes());
             let _ = writer.write_all(b"\n");
+            if let Some(next) = runs[i].next() {
+                heap.push(Reverse((next, i)));
+            }
         }
 
         Ok(())
@@ -528,15 +558,209 @@ impl Database {
     }
 }
 
-fn build_regex(pattern: &str, ignore_case: bool) -> Regex {
-    let re = UPPER_RE.get_or_init(|| Regex::new(r"[[:upper:]]").expect("Unable to compile regex"));
+fn exclude_newline(hir: Hir) -> Option<Hir> {
+    Some(match hir.into_kind() {
+        HirKind::Empty => Hir::empty(),
+        HirKind::Literal(Literal(lit)) => {
+            if lit.contains(&b'\n') {
+                return None;
+            }
+            Hir::literal(lit)
+        }
+        HirKind::Class(Class::Unicode(mut c)) => {
+            c.difference(&ClassUnicode::new([ClassUnicodeRange::new('\n', '\n')]));
+            Hir::class(Class::Unicode(c))
+        }
+        HirKind::Class(Class::Bytes(mut c)) => {
+            c.difference(&ClassBytes::new([ClassBytesRange::new(b'\n', b'\n')]));
+            Hir::class(Class::Bytes(c))
+        }
+        HirKind::Look(look) => Hir::look(look),
+        HirKind::Repetition(mut rep) => {
+            rep.sub = Box::new(exclude_newline(*rep.sub)?);
+            Hir::repetition(rep)
+        }
+        HirKind::Capture(mut cap) => {
+            cap.sub = Box::new(exclude_newline(*cap.sub)?);
+            Hir::capture(cap)
+        }
+        HirKind::Concat(subs) => Hir::concat(
+            subs.into_iter()
+                .map(exclude_newline)
+                .collect::<Option<_>>()?,
+        ),
+        HirKind::Alternation(subs) => Hir::alternation(
+            subs.into_iter()
+                .map(exclude_newline)
+                .collect::<Option<_>>()?,
+        ),
+    })
+}
 
-    match RegexBuilder::new(pattern)
-        .case_insensitive(ignore_case || !re.is_match(pattern))
-        .build()
-    {
-        Ok(re) => re,
-        Err(e) => panic!("invalid regex: {e}"),
+/// Sends `reader`'s contents in chunks of roughly `CHUNK_SIZE` that each end at a line boundary.
+fn read_chunks(
+    reader: &mut impl io::Read,
+    txs: &[channel::Sender<Arc<Vec<u8>>>],
+) -> io::Result<()> {
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut len = 0;
+
+    loop {
+        if len == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+        let n = read_full(reader, &mut buf[len..])?;
+        let eof = len + n < buf.len();
+        len += n;
+
+        let end = if eof {
+            len
+        } else if let Some(i) = memchr::memrchr(b'\n', &buf[..len]) {
+            i + 1
+        } else {
+            continue;
+        };
+
+        let mut next = vec![0u8; buf.len()];
+        next[..len - end].copy_from_slice(&buf[end..len]);
+        buf.truncate(end);
+        let chunk = Arc::new(std::mem::replace(&mut buf, next));
+        len -= end;
+
+        if txs.iter().any(|tx| tx.send(chunk.clone()).is_err()) || eof {
+            return Ok(());
+        }
+    }
+}
+
+fn read_full(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+pub struct Matcher {
+    line: Regex,
+    /// Finds a superset of the lines `line` matches when run over a whole newline-separated buffer.
+    buffer: Option<bytes::Regex>,
+}
+
+impl Matcher {
+    #[must_use]
+    pub fn new(pattern: &str, ignore_case: bool) -> Self {
+        Self::with_buffer_pattern(pattern, pattern, ignore_case)
+    }
+
+    /// Matches `pattern` against the basename only.
+    #[must_use]
+    pub fn basename(pattern: &str, ignore_case: bool) -> Self {
+        let line = format!("/[^/]*{pattern}[^/]*$");
+        // Dropping the leading `/[^/]*` keeps a superset of matches and lets the regex engine
+        // prefilter on the pattern's literals instead of on every `/`.
+        if pattern.starts_with(['*', '+', '?', '{']) {
+            Self::new(&line, ignore_case)
+        } else {
+            Self::with_buffer_pattern(&line, &format!("{pattern}[^/]*$"), ignore_case)
+        }
+    }
+
+    fn with_buffer_pattern(pattern: &str, buffer_pattern: &str, ignore_case: bool) -> Self {
+        let re =
+            UPPER_RE.get_or_init(|| Regex::new(r"[[:upper:]]").expect("Unable to compile regex"));
+        let case_insensitive = ignore_case || !re.is_match(pattern);
+
+        let line = match RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+        {
+            Ok(re) => re,
+            Err(e) => panic!("invalid regex: {e}"),
+        };
+
+        Self {
+            line,
+            buffer: Self::buffer_regex(buffer_pattern, case_insensitive),
+        }
+    }
+
+    // Parsed in multi-line + CRLF mode with `\n` removed from every class, so a buffer match never
+    // spans lines and any per-line match is a buffer match at the same offset. `\A`/`\z` have no
+    // such equivalent, so those patterns use line mode.
+    fn buffer_regex(pattern: &str, case_insensitive: bool) -> Option<bytes::Regex> {
+        let hir = regex_syntax::ParserBuilder::new()
+            .case_insensitive(case_insensitive)
+            .multi_line(true)
+            .crlf(true)
+            .build()
+            .parse(pattern)
+            .ok()?;
+        let looks = hir.properties().look_set();
+        if looks.contains(Look::Start) || looks.contains(Look::End) {
+            return None;
+        }
+        bytes::Regex::new(&exclude_newline(hir)?.to_string()).ok()
+    }
+
+    /// Pushes every line of `chunk` matching this pattern, highlighted, onto `out`.
+    pub fn search(&self, chunk: &[u8], out: &mut Vec<String>) {
+        let Some(buffer) = &self.buffer else {
+            let mut start = 0;
+            while start < chunk.len() {
+                let end = memchr::memchr(b'\n', &chunk[start..]).map_or(chunk.len(), |i| start + i);
+                self.push_if_match(chunk, start, end, out);
+                start = end + 1;
+            }
+            return;
+        };
+
+        let mut pos = 0;
+        while pos < chunk.len() {
+            let Some(m) = buffer.find_at(chunk, pos) else {
+                break;
+            };
+            let start = memchr::memrchr(b'\n', &chunk[pos..m.start()]).map_or(pos, |i| pos + i + 1);
+            if start == chunk.len() {
+                break;
+            }
+            let end =
+                memchr::memchr(b'\n', &chunk[m.start()..]).map_or(chunk.len(), |i| m.start() + i);
+            self.push_if_match(chunk, start, end, out);
+            pos = end + 1;
+        }
+    }
+
+    fn push_if_match(&self, chunk: &[u8], start: usize, end: usize, out: &mut Vec<String>) {
+        let mut line = &chunk[start..end];
+        if end < chunk.len() && line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        let line = str::from_utf8(line).expect("Invalid UTF-8");
+
+        if !self.line.is_match(line) {
+            return;
+        }
+
+        let mut highlighted = String::new();
+        let mut last_end = 0;
+
+        for mat in self.line.find_iter(line) {
+            highlighted.push_str(&line[last_end..mat.start()]);
+            highlighted.push_str("\x1b[31m");
+            highlighted.push_str(mat.as_str());
+            highlighted.push_str("\x1b[0m");
+            last_end = mat.end();
+        }
+
+        highlighted.push_str(&line[last_end..]);
+
+        out.push(highlighted);
     }
 }
 
@@ -572,13 +796,13 @@ fn main() -> Result<()> {
     } else {
         let ignore_case = args.ignore_case;
 
-        let patterns_re = args.pattern.iter().map(|p| build_regex(p, ignore_case));
+        let patterns_re = args.pattern.iter().map(|p| Matcher::new(p, ignore_case));
 
         let bn_patterns_re = args
             .basename_pattern
             .unwrap_or_default()
             .iter()
-            .map(|p| build_regex(&format!("/[^/]*{p}[^/]*$"), ignore_case))
+            .map(|p| Matcher::basename(p, ignore_case))
             .collect::<Vec<_>>();
 
         let chained = &patterns_re.chain(bn_patterns_re).collect::<Vec<_>>();
