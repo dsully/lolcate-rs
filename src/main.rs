@@ -567,6 +567,9 @@ fn exclude_newline(hir: Hir) -> Option<Hir> {
             c.difference(&ClassBytes::new([ClassBytesRange::new(b'\n', b'\n')]));
             Hir::class(Class::Bytes(c))
         }
+        // A line's end is before "\r\n" as well as "\n"; matching `\r` elsewhere is left to `.`.
+        HirKind::Look(Look::StartLF) => Hir::look(Look::StartCRLF),
+        HirKind::Look(Look::EndLF) => Hir::look(Look::EndCRLF),
         HirKind::Look(look) => Hir::look(look),
         HirKind::Repetition(mut rep) => {
             rep.sub = Box::new(exclude_newline(*rep.sub)?);
@@ -745,14 +748,13 @@ impl Matcher {
         }
     }
 
-    // Parsed in multi-line + CRLF mode with `\n` removed from every class, so a buffer match never
-    // spans lines and any per-line match is a buffer match at the same offset. `\A`/`\z` have no
-    // such equivalent, so those patterns use line mode.
+    // Parsed in multi-line mode with `\n` removed from every class and line anchors made CRLF-aware,
+    // so a buffer match never spans lines and any per-line match is a buffer match at the same
+    // offset. `\A`/`\z` have no such equivalent, so those patterns use line mode.
     fn buffer_regex(pattern: &str, case_insensitive: bool) -> Option<bytes::Regex> {
         let hir = regex_syntax::ParserBuilder::new()
             .case_insensitive(case_insensitive)
             .multi_line(true)
-            .crlf(true)
             .build()
             .parse(pattern)
             .ok()?;
