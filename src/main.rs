@@ -388,7 +388,9 @@ impl Database {
 
         let mut wd = ignore::WalkBuilder::new(paths.next().expect("No paths provided"));
 
-        wd.hidden(false)
+        // ignore >= 0.4.24 anchors patterns in the ignores file and the global gitignore at the CWD;
+        // anchor them at the filesystem root so absolute patterns keep working wherever lolcate runs.
+        wd.current_dir("/")
             .hidden(false)
             .follow_links(false)
             .git_global(true);
