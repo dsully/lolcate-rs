@@ -22,7 +22,6 @@ use std::{
 
 mod frame;
 use anyhow::{Context, Result};
-use bstr::io::BufReadExt;
 use clap::Parser;
 use colored::Colorize;
 use crossbeam_channel as channel;
@@ -212,8 +211,48 @@ impl Database {
         if !self.data.exists() {
             return Ok(0);
         }
-        let reader = io::BufReader::new(lz4::Decoder::new(fs::File::open(&self.data)?)?);
-        Ok(reader.byte_lines().count())
+        self.scan(|rx| {
+            rx.iter()
+                .map(|chunk| {
+                    // Chunks end at a line boundary, so only the last can hold an unterminated line.
+                    memchr::memchr_iter(b'\n', &chunk).count()
+                        + usize::from(chunk.last().is_some_and(|&b| b != b'\n'))
+                })
+                .sum()
+        })
+    }
+
+    /// Streams the decompressed database to `consume` as line-aligned chunks, while its content
+    /// checksum is verified on another thread.
+    fn scan<T: Send>(
+        &self,
+        consume: impl FnOnce(channel::Receiver<Arc<Vec<u8>>>) -> T + Send,
+    ) -> Result<T> {
+        let mut reader = FrameReader::new(fs::File::open(&self.data)?)?;
+        let (tx, rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
+        let (hash_tx, hash_rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
+
+        thread::scope(|s| {
+            let decoder = s.spawn(move || {
+                read_chunks(&mut reader, &[tx, hash_tx])?;
+                reader.stored_checksum()
+            });
+            let hasher = s.spawn(move || {
+                let mut hash = Xxh32::default();
+                for chunk in hash_rx {
+                    hash.update(&chunk);
+                }
+                hash.digest()
+            });
+
+            let result = consume(rx);
+            let stored = decoder.join().expect("Unable to join threads")?;
+            let actual = hasher.join().expect("Unable to join threads");
+            if stored.is_some_and(|stored| stored != actual) {
+                return Err(io::Error::other("LZ4 error: ERROR_contentChecksum_invalid").into());
+            }
+            Ok(result)
+        })
     }
 
     fn xdg_path(path_type: PathType) -> Result<PathBuf> {
@@ -314,52 +353,32 @@ impl Database {
             process::exit(1);
         }
 
-        let mut reader = FrameReader::new(fs::File::open(&self.data)?)?;
         let mut writer = io::BufWriter::with_capacity(OUTPUT_BUFFER, io::stdout().lock());
 
-        let (tx, rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
-        let (hash_tx, hash_rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
-
-        let runs = thread::scope(|s| -> Result<Vec<Matches>> {
-            let decoder = s.spawn(move || {
-                read_chunks(&mut reader, &[tx, hash_tx])?;
-                reader.stored_checksum()
-            });
-            let hasher = s.spawn(move || {
-                let mut hash = Xxh32::default();
-                for chunk in hash_rx {
-                    hash.update(&chunk);
-                }
-                hash.digest()
-            });
-
-            let workers: Vec<_> = (0..num_cpus::get())
-                .map(|_| {
-                    let rx = rx.clone();
-                    s.spawn(move || {
-                        let mut out = Matches::default();
-                        for chunk in rx {
-                            for matcher in patterns {
-                                matcher.search(&chunk, &mut out);
+        let runs = self.scan(|rx| {
+            thread::scope(|s| {
+                let workers: Vec<_> = (0..num_cpus::get())
+                    .map(|_| {
+                        let rx = rx.clone();
+                        s.spawn(move || {
+                            let mut out = Matches::default();
+                            for chunk in rx {
+                                for matcher in patterns {
+                                    matcher.search(&chunk, &mut out);
+                                }
                             }
-                        }
-                        out.sort();
-                        out
+                            out.sort();
+                            out
+                        })
                     })
-                })
-                .collect();
-            drop(rx);
+                    .collect();
+                drop(rx);
 
-            let runs: Vec<_> = workers
-                .into_iter()
-                .map(|worker| worker.join().expect("Unable to join threads"))
-                .collect();
-            let stored = decoder.join().expect("Unable to join threads")?;
-            let actual = hasher.join().expect("Unable to join threads");
-            if stored.is_some_and(|stored| stored != actual) {
-                return Err(io::Error::other("LZ4 error: ERROR_contentChecksum_invalid").into());
-            }
-            Ok(runs)
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("Unable to join threads"))
+                    .collect::<Vec<_>>()
+            })
         })?;
 
         let mut cursors: Vec<_> = runs.iter().map(|run| run.lines.iter()).collect();

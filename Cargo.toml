@@ -37,7 +37,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-bstr = "1"
 cachedir = "0.3.1"
 clap = { version = "4", features = ["cargo", "derive"] }
 colored = "3"
