@@ -9,6 +9,7 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
     io::{self, Read, Write},
+    ops::Range,
     path::{Path, PathBuf},
     process, str,
     sync::{
@@ -48,6 +49,7 @@ static UPPER_RE: OnceLock<Regex> = OnceLock::new();
 
 const CHUNK_SIZE: usize = 1 << 21;
 const CHUNK_QUEUE: usize = 16;
+const OUTPUT_BUFFER: usize = 256 * 1024;
 
 static PROJECT_CONFIG_TEMPLATE: &str = r#"
 description = ""
@@ -313,12 +315,12 @@ impl Database {
         }
 
         let mut reader = FrameReader::new(fs::File::open(&self.data)?)?;
-        let mut writer = io::BufWriter::new(io::stdout().lock());
+        let mut writer = io::BufWriter::with_capacity(OUTPUT_BUFFER, io::stdout().lock());
 
         let (tx, rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
         let (hash_tx, hash_rx) = channel::bounded::<Arc<Vec<u8>>>(CHUNK_QUEUE);
 
-        let runs = thread::scope(|s| -> Result<Vec<Vec<String>>> {
+        let runs = thread::scope(|s| -> Result<Vec<Matches>> {
             let decoder = s.spawn(move || {
                 read_chunks(&mut reader, &[tx, hash_tx])?;
                 reader.stored_checksum()
@@ -335,13 +337,13 @@ impl Database {
                 .map(|_| {
                     let rx = rx.clone();
                     s.spawn(move || {
-                        let mut out = vec![];
+                        let mut out = Matches::default();
                         for chunk in rx {
                             for matcher in patterns {
                                 matcher.search(&chunk, &mut out);
                             }
                         }
-                        out.sort_unstable();
+                        out.sort();
                         out
                     })
                 })
@@ -360,18 +362,18 @@ impl Database {
             Ok(runs)
         })?;
 
-        let mut runs: Vec<_> = runs.into_iter().map(Vec::into_iter).collect();
-        let mut heap: BinaryHeap<_> = runs
+        let mut cursors: Vec<_> = runs.iter().map(|run| run.lines.iter()).collect();
+        let mut heap: BinaryHeap<_> = cursors
             .iter_mut()
             .enumerate()
-            .filter_map(|(i, run)| Some(Reverse((run.next()?, i))))
+            .filter_map(|(i, cursor)| Some(Reverse((runs[i].line(cursor.next()?), i))))
             .collect();
 
-        while let Some(Reverse((m, i))) = heap.pop() {
-            let _ = writer.write_all(m.as_bytes());
+        while let Some(Reverse((line, i))) = heap.pop() {
+            let _ = writer.write_all(line);
             let _ = writer.write_all(b"\n");
-            if let Some(next) = runs[i].next() {
-                heap.push(Reverse((next, i)));
+            if let Some(next) = cursors[i].next() {
+                heap.push(Reverse((runs[i].line(next), i)));
             }
         }
 
@@ -812,7 +814,7 @@ impl Matcher {
     }
 
     /// Pushes every line of `chunk` matching this pattern, highlighted, onto `out`.
-    pub fn search(&self, chunk: &[u8], out: &mut Vec<String>) {
+    pub fn search(&self, chunk: &[u8], out: &mut Matches) {
         let Some(buffer) = &self.buffer else {
             let mut start = 0;
             while start < chunk.len() {
@@ -839,7 +841,7 @@ impl Matcher {
         }
     }
 
-    fn push_if_match(&self, chunk: &[u8], start: usize, end: usize, out: &mut Vec<String>) {
+    fn push_if_match(&self, chunk: &[u8], start: usize, end: usize, out: &mut Matches) {
         let mut line = &chunk[start..end];
         if end < chunk.len() && line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
@@ -850,20 +852,40 @@ impl Matcher {
             return;
         }
 
-        let mut highlighted = String::new();
+        let highlighted = &mut out.bytes;
+        let first = highlighted.len();
         let mut last_end = 0;
 
         for mat in self.line.find_iter(line) {
-            highlighted.push_str(&line[last_end..mat.start()]);
-            highlighted.push_str("\x1b[31m");
-            highlighted.push_str(mat.as_str());
-            highlighted.push_str("\x1b[0m");
+            highlighted.extend_from_slice(&line.as_bytes()[last_end..mat.start()]);
+            highlighted.extend_from_slice(b"\x1b[31m");
+            highlighted.extend_from_slice(mat.as_str().as_bytes());
+            highlighted.extend_from_slice(b"\x1b[0m");
             last_end = mat.end();
         }
 
-        highlighted.push_str(&line[last_end..]);
+        highlighted.extend_from_slice(&line.as_bytes()[last_end..]);
 
-        out.push(highlighted);
+        out.lines.push(first..highlighted.len());
+    }
+}
+
+/// Highlighted matching lines, stored back to back rather than allocated one by one.
+#[derive(Default)]
+pub struct Matches {
+    bytes: Vec<u8>,
+    lines: Vec<Range<usize>>,
+}
+
+impl Matches {
+    fn line(&self, range: &Range<usize>) -> &[u8] {
+        &self.bytes[range.clone()]
+    }
+
+    fn sort(&mut self) {
+        let bytes = &self.bytes;
+        self.lines
+            .sort_unstable_by(|a, b| bytes[a.clone()].cmp(&bytes[b.clone()]));
     }
 }
 
