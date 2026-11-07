@@ -7,11 +7,14 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap},
-    io::{self, Write},
+    collections::{BinaryHeap, HashSet},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process, str,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime},
 };
@@ -27,7 +30,6 @@ use figment::{
     providers::{Format, Toml},
 };
 use file_locking::FileExt as _;
-use file_type_enum::FileType;
 use frame::{FrameReader, Xxh32};
 use fs_err as fs;
 use fs4::FileExt;
@@ -282,17 +284,6 @@ impl Database {
         Ok(())
     }
 
-    fn is_apple_bundle(entry: &DirEntry) -> bool {
-        if let Some(path_str) = entry.path().to_str() {
-            return path_str.contains(".app/")
-                || path_str.contains(".bundle/")
-                || path_str.contains(".fcpbundle/")
-                || path_str.contains(".framework/");
-        }
-
-        false
-    }
-
     pub fn paths(&self) -> Result<Vec<PathBuf>> {
         let paths = Self::config(&self.name)?
             .paths
@@ -387,7 +378,10 @@ impl Database {
         Ok(())
     }
 
-    fn walker(&self) -> Result<ignore::WalkParallel> {
+    fn walker(
+        &self,
+        filter: impl Fn(&ignore::DirEntry) -> bool + Send + Sync + 'static,
+    ) -> Result<ignore::WalkParallel> {
         let mut paths = self.paths()?.into_iter();
 
         let mut wd = ignore::WalkBuilder::new(paths.next().expect("No paths provided"));
@@ -403,6 +397,7 @@ impl Database {
 
         wd.add_ignore(&self.ignores);
         wd.threads(num_cpus::get());
+        wd.filter_entry(filter);
 
         Ok(wd.build_parallel())
     }
@@ -460,9 +455,7 @@ impl Database {
             for entry in rx {
                 match entry {
                     WorkerResult::Entry(value) => {
-                        if FileType::symlink_read_at(&value).is_ok() {
-                            writeln!(encoder, "{}", value.display())?;
-                        }
+                        writeln!(encoder, "{}", value.display())?;
                     }
                     WorkerResult::Error(err) => print_err!("{}", err.to_string()),
                 }
@@ -471,15 +464,31 @@ impl Database {
             result
         });
 
-        let cache_dir: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::new(Mutex::new(BTreeSet::new()));
+        let indexer = Arc::new(Indexer {
+            tx,
+            unsearchable: Mutex::new(HashSet::new()),
+            any_unsearchable: AtomicBool::new(false),
+        });
 
-        self.walker()?.run(|| {
-            let tx = tx.clone();
-            let ig = cache_dir.clone();
+        // Excluded and bundle directories are decided here rather than in the visitor, because the
+        // walker reads a directory (and its ignore files) before visiting it.
+        let filter = {
+            let indexer = indexer.clone();
+            move |e: &ignore::DirEntry| {
+                if !e.file_type().is_none_or(|t| t.is_dir() || t.is_symlink()) {
+                    return true;
+                }
+                matches!(
+                    indexer.visit(e.path(), e.file_type(), false),
+                    ignore::WalkState::Continue
+                )
+            }
+        };
+
+        self.walker(filter)?.run(|| {
+            let indexer = indexer.clone();
 
             Box::new(move |e| {
-                //: Result<ignore::DirEntry,ignore::Error>
-
                 // Taken from sharkdp/fd
                 let entry = match e {
                     Ok(e) => DirEntry::Normal(e),
@@ -494,50 +503,30 @@ impl Database {
                             DirEntry::BrokenSymlink(path)
                         }
                         _ => {
-                            return match tx.send(WorkerResult::Error(ignore::Error::WithPath {
+                            return indexer.send(WorkerResult::Error(ignore::Error::WithPath {
                                 path,
                                 err: error,
-                            })) {
-                                Ok(()) => ignore::WalkState::Continue,
-                                Err(_) => ignore::WalkState::Quit,
-                            };
+                            }));
                         }
                     },
-                    Err(err) => {
-                        return match tx.send(WorkerResult::Error(err)) {
-                            Ok(()) => ignore::WalkState::Continue,
-                            Err(_) => ignore::WalkState::Quit,
-                        };
-                    }
+                    Err(err) => return indexer.send(WorkerResult::Error(err)),
                 };
 
-                if Self::is_apple_bundle(&entry) {
+                let root = match &entry {
+                    DirEntry::Normal(e) => e.depth() == 0,
+                    DirEntry::BrokenSymlink(_) => true,
+                };
+                let file_type = entry.file_type();
+                if !root && file_type.is_none_or(|t| t.is_dir() || t.is_symlink()) {
+                    // Already indexed by the filter.
                     return ignore::WalkState::Continue;
                 }
-
-                if let Ok(mut ignored) = ig.lock() {
-                    if cachedir::is_tagged(entry.path()).unwrap_or(false) {
-                        ignored.insert(entry.path().to_owned());
-                        return ignore::WalkState::Continue;
-                    }
-
-                    // Check if the parent directory is ignored.
-                    if ignored
-                        .iter()
-                        .any(|ignored_path| entry.path().starts_with(ignored_path))
-                    {
-                        return ignore::WalkState::Continue;
-                    }
-                }
-
-                match tx.send(WorkerResult::Entry(entry.path().to_owned())) {
-                    Ok(()) => ignore::WalkState::Continue,
-                    Err(_) => ignore::WalkState::Quit,
-                }
+                indexer.visit(entry.path(), file_type, root)
             })
         });
 
-        drop(tx);
+        // The writer finishes once the last sender, held by the indexer, is gone.
+        drop(indexer);
 
         stdout_thread.join().expect("Unable to join threads")?;
 
@@ -633,6 +622,120 @@ fn read_chunks(
     }
 }
 
+/// Decides which walked paths are indexed and sends them to the database writer.
+struct Indexer {
+    tx: channel::Sender<WorkerResult>,
+    unsearchable: Mutex<HashSet<PathBuf>>,
+    any_unsearchable: AtomicBool,
+}
+
+impl Indexer {
+    fn send(&self, result: WorkerResult) -> ignore::WalkState {
+        match self.tx.send(result) {
+            Ok(()) => ignore::WalkState::Continue,
+            Err(_) => ignore::WalkState::Quit,
+        }
+    }
+
+    /// Indexes `path` unless it is excluded; the result says whether to descend into it.
+    fn visit(
+        &self,
+        path: &Path,
+        file_type: Option<std::fs::FileType>,
+        root: bool,
+    ) -> ignore::WalkState {
+        // Bundle directories are never descended into, so only a root can lie inside one.
+        if root && is_inside_bundle(path) {
+            return ignore::WalkState::Skip;
+        }
+
+        let is_dir = file_type.is_some_and(|t| t.is_dir());
+        if file_type.is_none_or(|t| t.is_dir() || t.is_symlink()) {
+            match probe_dir(path) {
+                DirProbe::Tagged => return ignore::WalkState::Skip,
+                DirProbe::Unsearchable if is_dir => {
+                    self.unsearchable
+                        .lock()
+                        .expect("Unable to lock")
+                        .insert(path.to_owned());
+                    self.any_unsearchable.store(true, Ordering::Release);
+                }
+                _ => {}
+            }
+        }
+
+        let state = if is_dir && is_bundle_dir(path) {
+            ignore::WalkState::Skip
+        } else {
+            ignore::WalkState::Continue
+        };
+
+        // Without search permission on its directory an entry is listed but can't be stat'ed;
+        // such entries are not indexed.
+        if self.any_unsearchable.load(Ordering::Acquire)
+            && path.parent().is_some_and(|parent| {
+                self.unsearchable
+                    .lock()
+                    .expect("Unable to lock")
+                    .contains(parent)
+            })
+        {
+            return state;
+        }
+
+        match self.send(WorkerResult::Entry(path.to_owned())) {
+            ignore::WalkState::Quit => ignore::WalkState::Quit,
+            _ => state,
+        }
+    }
+}
+
+fn is_inside_bundle(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| {
+        [".app/", ".bundle/", ".fcpbundle/", ".framework/"]
+            .iter()
+            .any(|bundle| path.contains(bundle))
+    })
+}
+
+fn is_bundle_dir(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| {
+        [".app", ".bundle", ".fcpbundle", ".framework"]
+            .iter()
+            .any(|suffix| path.ends_with(suffix))
+    })
+}
+enum DirProbe {
+    Tagged,
+    Untagged,
+    Unsearchable,
+}
+
+/// One `open` both checks `dir` for a valid `CACHEDIR.TAG` and, since that needs search
+/// permission on `dir`, whether its entries can be stat'ed.
+fn probe_dir(dir: &Path) -> DirProbe {
+    match std::fs::File::open(dir.join("CACHEDIR.TAG")) {
+        Ok(mut tag) => {
+            let mut header = [0u8; cachedir::HEADER.len()];
+            if tag
+                .read(&mut header)
+                .is_ok_and(|n| n == header.len() && header == *cachedir::HEADER)
+            {
+                DirProbe::Tagged
+            } else {
+                DirProbe::Untagged
+            }
+        }
+        // EACCES may also come from an unreadable tag file in a searchable directory.
+        Err(e)
+            if e.kind() == io::ErrorKind::PermissionDenied
+                && dir.join(".").symlink_metadata().is_err() =>
+        {
+            DirProbe::Unsearchable
+        }
+        Err(_) => DirProbe::Untagged,
+    }
+}
 fn read_full(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
