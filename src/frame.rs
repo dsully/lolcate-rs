@@ -33,10 +33,11 @@ const UNCOMPRESSED_BLOCK: u32 = 0x8000_0000;
 const HISTORY: usize = 64 * 1024;
 const INPUT_SIZE: usize = 1 << 20;
 const CHECK_QUEUE: usize = 64;
-const WORK_QUEUE: usize = 32;
+const CHUNK_QUEUE: usize = 16;
+const WORK_QUEUE: usize = 256;
 
 /// A line-aligned piece of the decompressed stream.
-pub struct Chunk {
+struct Chunk {
     buf: Vec<u8>,
     range: Range<usize>,
 }
@@ -224,25 +225,34 @@ impl Block {
     }
 }
 
-/// Decodes the first lz4 frame of `input` into line-aligned chunks sent to `tx`, in no particular
-/// order.
+/// Receives decoded lines on one thread; `decode` makes one per thread.
+pub trait Consume: Send {
+    /// Takes whole lines, each `\n`-terminated except possibly the stream's last.
+    fn consume(&mut self, lines: &[u8]);
+
+    /// Runs on the consumer's thread once its input is done.
+    fn finish(&mut self) {}
+}
+
+/// Decodes the first lz4 frame of `input`, feeding its lines, in no particular order, to
+/// consumers made by `new_consumer`, and returns them.
 ///
 /// Block checksums, when present, are verified instead of the content checksum, so independent
-/// blocks can be decoded and verified in parallel. A truncated frame ends the stream early, as
-/// `lz4::Decoder` does.
-pub fn decode(
+/// blocks can be decoded, verified and consumed in parallel. A truncated frame ends the stream
+/// early, as `lz4::Decoder` does.
+pub fn decode<C: Consume>(
     input: impl Read,
     chunk_size: usize,
-    tx: &channel::Sender<Arc<Chunk>>,
-) -> io::Result<()> {
+    new_consumer: &(impl Fn() -> C + Sync),
+) -> io::Result<Vec<C>> {
     let mut input = BufReader::with_capacity(INPUT_SIZE, input);
     let Some(frame) = read_header(&mut input)? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if frame.independent && (frame.block_checksum || !frame.content_checksum) {
-        decode_parallel(&mut input, &frame, tx)
+        decode_parallel(&mut input, &frame, new_consumer)
     } else {
-        decode_sequential(&mut input, &frame, chunk_size, tx)
+        decode_sequential(&mut input, &frame, chunk_size, new_consumer)
     }
 }
 
@@ -264,23 +274,44 @@ fn run_checks(checks: channel::Receiver<Check>) -> io::Result<u32> {
 
 /// Decodes in stream order (required for linked blocks and for the content checksum), with
 /// checksums verified on another thread.
-fn decode_sequential(
+fn decode_sequential<C: Consume>(
     input: &mut impl Read,
     frame: &Frame,
     chunk_size: usize,
-    tx: &channel::Sender<Arc<Chunk>>,
-) -> io::Result<()> {
+    new_consumer: &(impl Fn() -> C + Sync),
+) -> io::Result<Vec<C>> {
     let hash_content = frame.content_checksum && !frame.block_checksum;
     let (check_tx, check_rx) = channel::bounded(CHECK_QUEUE);
+    let (tx, rx) = channel::bounded::<Arc<Chunk>>(CHUNK_QUEUE);
     thread::scope(|s| {
         let checker = s.spawn(move || run_checks(check_rx));
-        let stored = decode_in_order(input, frame, chunk_size, tx, &check_tx, hash_content);
+        let consumers: Vec<_> = (0..num_cpus::get())
+            .map(|_| {
+                let rx = rx.clone();
+                s.spawn(move || {
+                    let mut consumer = new_consumer();
+                    for chunk in rx {
+                        consumer.consume(&chunk);
+                    }
+                    consumer.finish();
+                    consumer
+                })
+            })
+            .collect();
+        drop(rx);
+
+        let stored = decode_in_order(input, frame, chunk_size, &tx, &check_tx, hash_content);
+        drop(tx);
         drop(check_tx);
+        let consumers = consumers
+            .into_iter()
+            .map(|consumer| consumer.join().expect("Unable to join threads"))
+            .collect();
         let digest = checker.join().expect("Unable to join threads")?;
         if stored?.is_some_and(|stored| hash_content && stored != digest) {
             return Err(lz4_error("ERROR_contentChecksum_invalid"));
         }
-        Ok(())
+        Ok(consumers)
     })
 }
 
@@ -373,22 +404,34 @@ struct Edges {
     tail: Option<Vec<u8>>,
 }
 
-fn decode_parallel(
+/// Decodes independent blocks on worker threads, each consuming the lines of the blocks it decodes
+/// while they are in cache.
+fn decode_parallel<C: Consume>(
     input: &mut impl Read,
     frame: &Frame,
-    tx: &channel::Sender<Arc<Chunk>>,
-) -> io::Result<()> {
+    new_consumer: &(impl Fn() -> C + Sync),
+) -> io::Result<Vec<C>> {
     let (work_tx, work_rx) = channel::bounded::<(usize, Block)>(WORK_QUEUE);
 
-    let edges = thread::scope(|s| {
+    let (mut consumers, edges) = thread::scope(|s| {
         let workers: Vec<_> = (0..num_cpus::get())
             .map(|_| {
                 let work_rx = work_rx.clone();
-                s.spawn(move || {
-                    work_rx
-                        .into_iter()
-                        .map(|(index, block)| decode_independent(index, &block, frame, tx))
-                        .collect::<io::Result<Vec<_>>>()
+                s.spawn(move || -> io::Result<(C, Vec<Edges>)> {
+                    let mut consumer = new_consumer();
+                    let mut buf = Vec::new();
+                    let mut edges = Vec::new();
+                    for (index, block) in work_rx {
+                        edges.push(decode_independent(
+                            index,
+                            &block,
+                            frame.block_max,
+                            &mut buf,
+                            &mut consumer,
+                        )?);
+                    }
+                    consumer.finish();
+                    Ok((consumer, edges))
                 })
             })
             .collect();
@@ -414,55 +457,55 @@ fn decode_parallel(
         };
         drop(work_tx);
 
+        let mut consumers = Vec::with_capacity(workers.len() + 1);
         let mut edges = Vec::with_capacity(index);
         for worker in workers {
-            edges.extend(worker.join().expect("Unable to join threads")?);
+            let (consumer, worker_edges) = worker.join().expect("Unable to join threads")?;
+            consumers.push(consumer);
+            edges.extend(worker_edges);
         }
-        read.map(|()| edges)
+        read.map(|()| (consumers, edges))
     })?;
 
     let stitched = stitch(edges);
     if !stitched.is_empty() {
-        let _ = tx.send(Arc::new(Chunk {
-            range: 0..stitched.len(),
-            buf: stitched,
-        }));
+        let mut consumer = new_consumer();
+        consumer.consume(&stitched);
+        consumer.finish();
+        consumers.push(consumer);
     }
-    Ok(())
+    Ok(consumers)
 }
 
-/// Sends the block's complete lines to `tx` and returns the partial lines at its edges.
+/// Decodes the block into `buf`, consumes its complete lines and returns the partial lines at
+/// its edges.
 fn decode_independent(
     index: usize,
     block: &Block,
-    frame: &Frame,
-    tx: &channel::Sender<Arc<Chunk>>,
+    block_max: usize,
+    buf: &mut Vec<u8>,
+    consumer: &mut impl Consume,
 ) -> io::Result<Edges> {
     block.verify()?;
-    let mut buf = vec![0u8; frame.block_max];
-    let len = block.decode_into(&mut buf, &[], frame.block_max)?;
+    buf.resize(block_max, 0);
+    let len = block.decode_into(buf, &[], block_max)?;
     buf.truncate(len);
 
-    let (Some(first), Some(last)) = (memchr::memchr(b'\n', &buf), memchr::memrchr(b'\n', &buf))
+    let (Some(first), Some(last)) = (memchr::memchr(b'\n', buf), memchr::memrchr(b'\n', buf))
     else {
         return Ok(Edges {
             index,
-            head: buf,
+            head: buf.clone(),
             tail: None,
         });
     };
-    let head = buf[..=first].to_vec();
-    let tail = buf[last + 1..].to_vec();
     if first < last {
-        let _ = tx.send(Arc::new(Chunk {
-            buf,
-            range: first + 1..last + 1,
-        }));
+        consumer.consume(&buf[first + 1..=last]);
     }
     Ok(Edges {
         index,
-        head,
-        tail: Some(tail),
+        head: buf[..=first].to_vec(),
+        tail: Some(buf[last + 1..].to_vec()),
     })
 }
 
@@ -599,12 +642,11 @@ impl Xxh32 {
 mod tests {
     use std::io::Write;
 
-    use crossbeam_channel as channel;
     use lz4::{BlockMode, BlockSize, ContentChecksum, EncoderBuilder, liblz4::BlockChecksum};
 
     use std::collections::HashSet;
 
-    use super::{Xxh32, decode, xxh32};
+    use super::{Consume, Xxh32, decode, xxh32};
 
     /// Path-like lines, a stretch of incompressible lines (stored as uncompressed blocks), and a
     /// line longer than any chunk or block.
@@ -672,11 +714,19 @@ mod tests {
         }
     }
 
+    struct Collect(Vec<Vec<u8>>);
+
+    impl Consume for Collect {
+        fn consume(&mut self, lines: &[u8]) {
+            self.0.push(lines.to_vec());
+        }
+    }
+
     fn decode_all(compressed: &[u8]) -> (Vec<Vec<u8>>, std::io::Result<()>) {
-        let (tx, rx) = channel::unbounded();
-        let result = decode(compressed, 1 << 20, &tx);
-        drop(tx);
-        (rx.into_iter().map(|chunk| chunk.to_vec()).collect(), result)
+        match decode(compressed, 1 << 20, &|| Collect(Vec::new())) {
+            Ok(consumers) => (consumers.into_iter().flat_map(|c| c.0).collect(), Ok(())),
+            Err(e) => (Vec::new(), Err(e)),
+        }
     }
 
     fn lines(data: &[u8]) -> Vec<&[u8]> {
