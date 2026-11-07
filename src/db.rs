@@ -1,6 +1,6 @@
-use std::{io::Write, path::PathBuf, process};
+use std::{io::Write, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use figment::{
     Figment,
@@ -137,8 +137,7 @@ impl Database {
 
     pub fn create(&self) -> Result<()> {
         if self.root.exists() {
-            print_err!("database {} already exists", &self.name.green());
-            process::exit(1);
+            bail!("database {} already exists", self.name.green());
         }
 
         fs::create_dir_all(&self.root)?;
@@ -154,7 +153,7 @@ impl Database {
         println!("- the configuration file: {}", self.config.display());
         println!("- the ignores file:       {}", self.ignores.display());
 
-        process::exit(0);
+        Ok(())
     }
 
     pub fn info() -> Result<()> {

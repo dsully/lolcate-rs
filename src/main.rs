@@ -5,8 +5,11 @@
     clippy::missing_panics_doc
 )]
 
+use std::process;
+
 use anyhow::Result;
 use clap::Parser;
+use colored::Colorize;
 
 macro_rules! print_err {
     ($($err:tt)*) => ({
@@ -60,9 +63,14 @@ pub struct Args {
     pub pattern: Vec<String>,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn main() {
+    if let Err(e) = run(Args::parse()) {
+        print_err!("{e:#}");
+        process::exit(1);
+    }
+}
 
+fn run(args: Args) -> Result<()> {
     let databases = if args.all {
         Database::all()?
     } else {

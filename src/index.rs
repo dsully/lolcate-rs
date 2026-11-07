@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -11,7 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use colored::Colorize;
 use crossbeam_channel as channel;
 use file_locking::FileExt as _;
@@ -83,21 +82,19 @@ impl Database {
     pub fn update(&self) -> Result<()> {
         //
         if !self.config.exists() {
-            print_err!(
+            bail!(
                 "Config file not found for database {}.\n Perhaps you forgot to run lolcate --create \
              {} ?",
-                &self.name.green(),
-                &self.name.green()
+                self.name.green(),
+                self.name.green()
             );
-            process::exit(1);
         }
 
         if self.paths().unwrap_or_default().is_empty() {
-            print_err!(
+            bail!(
                 "{} needs at least one directory to scan",
                 self.config.display().to_string().green()
             );
-            process::exit(1);
         }
 
         let parent = self.data.parent().expect("Unable to get parent");

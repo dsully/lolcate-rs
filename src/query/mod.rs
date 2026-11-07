@@ -6,10 +6,10 @@ use std::{
     collections::BinaryHeap,
     io::{self, Write},
     ops::Range,
-    process, thread,
+    thread,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use colored::Colorize;
 
 use crate::{db::Database, frame::Consume};
@@ -22,21 +22,19 @@ const MERGE_SAMPLE_STEP: usize = 64;
 impl Database {
     pub fn query(&self, patterns: &Patterns) -> Result<()> {
         if !self.data.parent().expect("Unable to get parent").exists() {
-            print_err!(
+            bail!(
                 "Database {} doesn't exist. Perhaps you forgot to run lolcate --create {} ?",
-                &self.name.green(),
-                &self.name.green()
+                self.name.green(),
+                self.name.green()
             );
-            process::exit(1);
         }
 
         if !self.data.exists() {
-            print_err!(
+            bail!(
                 "Database {} is empty. Perhaps you forgot to run lolcate --update {} ?",
-                &self.name.green(),
-                &self.name.green()
+                self.name.green(),
+                self.name.green()
             );
-            process::exit(1);
         }
 
         let mut writer = io::BufWriter::with_capacity(OUTPUT_BUFFER, io::stdout().lock());
